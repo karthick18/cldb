@@ -1,0 +1,154 @@
+	                      CLDB  
+		             ---------------
+A flat-file Database that can be used as an alternative to other existing databases like GDBM/BERKELEY.
+The API provided by the DB can be traced to cldb_api.h incase you want to write plugins for this DB.
+The ondisk layout of the DB is a Red black tree with Block GROUPS 
+for free record management.
+It has a configurable 2 MB database cache.
+The database layout is explained below:
+The start of the DB is the DB header which contains the map to the root of the RB TREE, linear list and grouping information.
+After the header thats 1 block size (or 512 bytes), the database group starts.
+The database group contains the group metadata of 1 block followed
+by the database ctrl blocks pertaining to that GROUPS records.
+The metadata is followed by the data for that GROUP.
+The start of the next group succeeds the end of the data of the previous group aligned at a block size boundary.
+Within a group, the free list management takes place through a linear indexing array. Each group contains the offset of the next group.
+Database additions/deletions or updates goes through a commit phase.
+This commit actually only ensures that you either update the DB record or you dont. If I/O failure happens during the commit end phase, the behaviour is undefined.
+Recovery isnt through yet in this alpha release, and is in the TODO list.
+The commit phase of the DB update sets the DB cache in passthru mode.
+Records that are touched as a result of a database addition incurring a rbtree addition followed by rebalancing, are synced with the DB cache by touching the records marked for updation and queueing them to the DBs commit queue.
+Then once all the records are touched, and update is done,the marked records are flushed and the LRU cache shrunk.
+The flushing phase of the marked records takes place through I/O vectoring wherein contiguous marked records are merged and then flushed.
+Offsets for database records that are added are obtained by interpreting the block group metadata. Before getting to know the process of free offset management in CLDB, you should know about group mgmt.
+The database is divided into different groups.
+A group contains the metadata to manage the free record, offset information for the database.
+The group is split up into 3 parts:
+a) Group metadata thats 1 block or 512
+b) DB record metadata. Number of DB metadata records or struct cl_db records depends on CLDB_GROUP_FREE_LIST macro in cldb_group.h
+c) The DB data for the groups DB records.
+The start of the next group is the end of the previous groups data offset aligned to a block boundary.
+The offset thats obtained for the new DB record getting added, is obtained in the manner illustrated below:
+a) First try getting the offset from the DB headers free_group. A free group is the one that contains a free record. Whenever a new record addition entails a new group creation, this field is updated. Also whenever a record for the group is freed back to the group, the free group is updated if it happens to be a valid group(-All records were used at some point) and the available maxlen exceeds the requested DB record thats getting added.
+b) If (a) fails, then try getting the offset from the group cache.
+  A group cache is a tree of datalen,offset cache info. thats sorted by datalen of the DB record.In the eventuality of a cache hit, the cache entry for the record offset obtained from the cache is deleted.
+c) If (b) fails, then try getting it from the valid free group if any whose maxlen is greater or equal to the requested datalen.
+d) If all the above fail, then a new group is created and the DB record offset fetched from that group is given back. 
+
+Offsets are released back to the groups from which they were taken.
+Record deletions bring back the records to the groups from which they were taken. Deleted record datalen,offsets are added to the group cache for the DB.
+If the current free_group is a valid one and the datalen exceeds the current maxlen, than the free group is updated with the new offset and datalen.
+
+
+The structure layout of the group metadata,DB header and DB ctrl data are mentioned below:
+
+DB HEADER:
+---------
+
+struct cl_db_header {
+  cldb_offset_t offset; /*Offset where it resides on-disk*/
+  unsigned int magic;/*DB magic*/
+  unsigned int version;/*DB version*/
+  unsigned long records;/*number of DB records present*/
+  cldb_offset_t last_offset;/*start of the last offset allocated*/
+  cldb_offset_t  root; /*root offset of the rbtree*/
+  cldb_offset_t  first;/*starting offset of the linear list*/
+  cldb_offset_t  group; /*starting offset of the group*/
+  cldb_offset_t  last_group; /*last group*/
+  cldb_offset_t next_free_group;/*offset of the next free group to allocate*/
+  cldb_offset_t free_group; /*start offset of a free group*/
+  long maxlen; /*max record len available for reuse from the free_group*/
+  unsigned long groups; /*number of groups*/
+  unsigned short cksum; /*header checksum*/
+} __attribute__((packed));
+
+DB CTRL DATA PER RECORD
+-----------------------
+struct cl_db { 
+  /*Offset of the record*/
+  cldb_offset_t offset; 
+
+  /*For the RBtree*/
+  cldb_offset_t left;
+  cldb_offset_t right;
+  cldb_offset_t parent;
+  unsigned char colour;
+
+  /*For the queue maintenance*/
+  cldb_offset_t next;
+  cldb_offset_t prev;
+  cldb_offset_t group; /*the group to which this guy belongs*/
+  /*The data portion*/
+  unsigned int keylen;
+  unsigned int datalen;
+  /*This is used whenever the record is added first.
+    The first addition of the record is considered as the
+    max. record capacity with potential of reuse.
+  */
+  long maxlen; 
+  cldb_offset_t data_offset; /*data offset for the record*/
+  unsigned short cksum;
+  /*The below arent stored on-disk*/
+  unsigned char *key;
+  unsigned char *data;
+
+} __attribute__((packed));
+
+
+DB GROUP
+--------
+struct cl_db_group {
+  cldb_offset_t offset; /*the offset where it resides on-disk*/
+  cldb_offset_t next; /*next group offset*/
+  short free;/*index of the first free element*/
+  /*index of the last free to use incase of invalid groups.
+    Group considered invalid as long as all its slots arent used
+  */
+  short last_free;
+  /*tail points to the slot that was freed when we werent valid.
+   Some dirty games here just to pull more ctrl data within a group:-)
+  */
+  short tail; 
+  /*you can reuse this group if all the slots were occupied in this group
+   The short is just to make the free short list aligned 
+  */
+  short valid;
+  /*Data offset to be granted*/
+  cldb_offset_t next_data_offset;
+  /*Max len of the guy that can be reused within this group
+    for faster reuse.
+  */
+  long maxlen; 
+  /*The free list array for this group*/
+  short array[CLDB_GROUP_FREE_LIST];
+  unsigned short cksum; /*group cksum*/
+} __attribute__((packed));
+
+DB test codes:
+--------------
+
+There are some simple test codes for db testing.
+To add N records where N=1000 and DB to create=db1
+
+./cldb_add db1 1000
+To add N records starting at record number X, and delete N2 records starting at record number Y, Z Times, use cldb_test:
+./cldb_test db1 filename [N] [X] [Y] [N2] [Z]
+To dump the DB as a tree:
+./cldb_dump db1 
+To dump as a linear list in the order in which it was added:
+./cldb_dump db1 1
+To update N records where N = 1000:
+./cldb_update db1 1000
+To add 100 records starting at X (used for key creation by test code)
+./cldb_add db1 100 db1 a 1001
+To del 100 records starting at X
+./cldb_del db1 100 db1 100
+To fetch all the records as a iterator:
+./cldb_record_get db1
+To find a record by Key:
+./cldb_find db1  K_100
+To find all the records inserted:(assuming 1000 inserts)
+./cldb_test_find db1 1000
+Default DB creation location for the test code = /home/karthick/db
+
+-Karthick

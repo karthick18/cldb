@@ -1,0 +1,4 @@
+a)Improve existing group management and make it more efficient -DONE - But still can be improved.
+b)I/O vectoring while touching contiguous records- DONE  (for writes and commit phase)
+
+c)DB recovery and atomicity
